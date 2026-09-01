@@ -1,6 +1,7 @@
+use super::model_provider::*;
 use super::residency::is_v2_resident_session_source;
 use super::*;
-use crate::agent::role::apply_role_to_config;
+use crate::agent::role::apply_role_to_config_for_resume;
 use crate::codex_thread::CodexThread;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
@@ -17,6 +18,7 @@ use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ExtensionDataInit;
 use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::protocol::EnvironmentConfigState;
+use codex_thread_store::StoredThread;
 use codex_utils_path_uri::PathUri;
 
 const AGENT_NAMES: &str = include_str!("../../../assets/agent/agent_names.txt");
@@ -152,6 +154,40 @@ async fn load_agent_model_context(
                 .items,
         )),
     }
+}
+
+async fn restore_resumed_subagent_model_config(
+    state: &ThreadManagerState,
+    config: &mut Config,
+    stored_thread: &StoredThread,
+    session_source: &SessionSource,
+) -> CodexResult<Option<ThreadId>> {
+    let Some(recorded_parent_thread_id) = stored_thread
+        .parent_thread_id
+        .or_else(|| stored_thread.source.parent_thread_id())
+    else {
+        return Ok(None);
+    };
+    let parent_thread_id = session_source
+        .parent_thread_id()
+        .unwrap_or(recorded_parent_thread_id);
+
+    config.model_reasoning_effort = stored_thread.reasoning_effort.clone();
+    let model_provider_baseline =
+        model_provider_baseline_for_parent(state, config, Some(parent_thread_id)).await?;
+    restore_persisted_agent_model_provider(
+        config,
+        &model_provider_baseline,
+        &stored_thread.model_provider,
+    )?;
+    if let Some(role_name) = stored_thread.agent_role.as_deref() {
+        apply_role_to_config_for_resume(config, Some(role_name))
+            .await
+            .map_err(CodexErr::InvalidRequest)?;
+    }
+    restore_persisted_agent_model(config, stored_thread.model.clone());
+
+    Ok(Some(parent_thread_id))
 }
 
 impl AgentControl {
@@ -382,7 +418,17 @@ impl AgentControl {
                 return Ok(());
             }
         }
+        let parent_thread_id = owner_thread_id
+            .or_else(|| initial_history.get_resumed_parent_thread_id())
+            .or(stored_parent_thread_id);
         config.model_reasoning_effort = stored_reasoning_effort;
+        let model_provider_baseline =
+            model_provider_baseline_for_parent(&state, &config, parent_thread_id).await?;
+        restore_persisted_agent_model_provider(
+            &mut config,
+            &model_provider_baseline,
+            &stored_model_provider,
+        )?;
         if let Some(role_name) = session_source.get_agent_role() {
             let runtime_approval_policy = config.permissions.approval_policy.value();
             let runtime_approvals_reviewer = config.approvals_reviewer;
@@ -400,7 +446,7 @@ impl AgentControl {
                 ),
             };
 
-            apply_role_to_config(&mut config, Some(&role_name))
+            apply_role_to_config_for_resume(&mut config, Some(&role_name))
                 .await
                 .map_err(CodexErr::InvalidRequest)?;
             config
@@ -420,24 +466,7 @@ impl AgentControl {
                 })?;
         }
         config.service_tier = self.root_service_tier();
-        if let Some(model) = stored_model {
-            config.model = Some(model);
-        }
-        if config.model_provider_id != stored_model_provider {
-            config.model_provider = config
-                .model_providers
-                .get(&stored_model_provider)
-                .cloned()
-                .ok_or_else(|| {
-                    CodexErr::InvalidRequest(format!(
-                        "Model provider `{stored_model_provider}` not found"
-                    ))
-                })?;
-            config.model_provider_id = stored_model_provider;
-        }
-        let parent_thread_id = owner_thread_id
-            .or_else(|| initial_history.get_resumed_parent_thread_id())
-            .or(stored_parent_thread_id);
+        restore_persisted_agent_model(&mut config, stored_model);
         let (inherited_environments, inherited_exec_policy, client_mcp_extensions) = if let Some(
             (parent, parent_environments),
         ) =
@@ -593,6 +622,13 @@ impl AgentControl {
         options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
         let state = self.upgrade()?;
+        validate_history_fork_model_provider(
+            &state,
+            &config,
+            session_source.as_ref(),
+            options.fork_mode.as_ref(),
+        )
+        .await?;
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
                 &InitialHistory::New,
@@ -825,6 +861,7 @@ impl AgentControl {
 
         let parent_thread_id = *parent_thread_id;
         let parent_thread = state.get_thread(parent_thread_id).await?;
+        let parent_config = parent_thread.session.get_config().await;
         let (subagent_developer_instructions, parent_developer_instructions) = match (
             multi_agent_version,
             config
@@ -885,7 +922,6 @@ impl AgentControl {
         }
         let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
             if multi_agent_version == MultiAgentVersion::V2 {
-                let parent_config = parent_thread.session.get_config().await;
                 let parent_usage_hints = resolve_usage_hints(
                     &parent_config.multi_agent_v2,
                     /*catalog*/ None,
@@ -1168,7 +1204,7 @@ impl AgentControl {
 
     async fn resume_single_agent_from_rollout(
         &self,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
@@ -1188,6 +1224,13 @@ impl AgentControl {
             .map_err(|err| CodexErr::InvalidRequest(format!("invalid stored agent path: {err}")))?;
         let resumed_agent_nickname = stored_thread.agent_nickname.clone();
         let resumed_agent_role = stored_thread.agent_role.clone();
+        let parent_thread_id = restore_resumed_subagent_model_config(
+            &state,
+            &mut config,
+            &stored_thread,
+            &session_source,
+        )
+        .await?;
         let history = load_agent_model_context(&state, thread_id, stored_thread.history_mode)
             .await?
             .ok_or(CodexErr::ThreadNotFound(thread_id))?;
@@ -1196,7 +1239,6 @@ impl AgentControl {
             history: Arc::new(history),
             rollout_path: stored_thread.rollout_path,
         });
-        let parent_thread_id = stored_thread.parent_thread_id;
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
                 &initial_history,

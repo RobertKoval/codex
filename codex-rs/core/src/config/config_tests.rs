@@ -8337,6 +8337,10 @@ async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result
 async fn agent_role_relative_config_file_resolves_against_config_toml() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let role_config_path = codex_home.path().join("agents").join("researcher.toml");
+    let expected_catalog_path = role_config_path
+        .parent()
+        .expect("role config should have a parent directory")
+        .join("models.json");
     tokio::fs::create_dir_all(
         role_config_path
             .parent()
@@ -8345,7 +8349,7 @@ async fn agent_role_relative_config_file_resolves_against_config_toml() -> std::
     .await?;
     tokio::fs::write(
         &role_config_path,
-        "developer_instructions = \"Research carefully\"\nmodel = \"gpt-5\"",
+        "developer_instructions = \"Research carefully\"\nmodel = \"gpt-5\"\nmodel_provider = \"ollama\"\nmodel_catalog_json = \"models.json\"",
     )
     .await?;
     tokio::fs::write(
@@ -8374,6 +8378,22 @@ nickname_candidates = ["Hypatia", "Noether"]
         config
             .agent_roles
             .get("researcher")
+            .and_then(|role| role.model_provider.as_deref()),
+        Some("ollama"),
+        "user-owned role files may carry provider-selection authority"
+    );
+    assert_eq!(
+        config
+            .agent_roles
+            .get("researcher")
+            .and_then(|role| role.model_catalog_json.as_deref()),
+        Some(expected_catalog_path.as_path()),
+        "user-owned role files may carry model-catalog authority"
+    );
+    assert_eq!(
+        config
+            .agent_roles
+            .get("researcher")
             .and_then(|role| role.nickname_candidates.as_ref())
             .map(|candidates| candidates.iter().map(String::as_str).collect::<Vec<_>>()),
         Some(vec!["Hypatia", "Noether"])
@@ -8394,7 +8414,7 @@ async fn agent_role_relative_config_file_resolves_from_config_layer() -> std::io
     .await?;
     tokio::fs::write(
         &role_config_path,
-        "developer_instructions = \"Research carefully\"\nmodel = \"gpt-5\"",
+        "developer_instructions = \"Research carefully\"\nmodel = \"gpt-5\"\nmodel_provider = \"ollama\"\nmodel_catalog_json = \"models.json\"",
     )
     .await?;
     let layer_config = toml::from_str(
@@ -8435,6 +8455,14 @@ config_file = "./agents/researcher.toml"
             .get("researcher")
             .and_then(|role| role.config_file.as_ref()),
         Some(&role_config_path)
+    );
+    assert_eq!(
+        config
+            .agent_roles
+            .get("researcher")
+            .and_then(|role| role.model_provider.as_deref()),
+        Some("ollama"),
+        "user config layers may authorize provider selection in their role files"
     );
 
     Ok(())
@@ -8900,6 +8928,8 @@ trust_level = "trusted"
 name = "researcher"
 description = "from root"
 developer_instructions = "Research carefully"
+model_provider = "ollama"
+model_catalog_json = "project-models.json"
 "#,
     )?;
 
@@ -8961,6 +8991,22 @@ developer_instructions = "Write carefully"
             .get("researcher")
             .and_then(|role| role.description.as_deref()),
         Some("from root")
+    );
+    assert_eq!(
+        config
+            .agent_roles
+            .get("researcher")
+            .and_then(|role| role.model_provider.as_deref()),
+        None,
+        "project-owned role files must not carry provider-selection authority"
+    );
+    assert_eq!(
+        config
+            .agent_roles
+            .get("researcher")
+            .and_then(|role| role.model_catalog_json.as_ref()),
+        None,
+        "project-owned role files must not carry model-catalog authority"
     );
     assert_eq!(
         config
@@ -9034,6 +9080,7 @@ nickname_candidates = ["Ada"]
         r#"
 developer_instructions = "Research carefully"
 model = "gpt-5.2"
+model_provider = "ollama"
 "#,
     )
     .await?;
@@ -9093,6 +9140,14 @@ model = "gpt-5.2"
             .get("researcher")
             .and_then(|role| role.config_file.as_ref()),
         Some(&standalone_agents_dir.join("researcher.toml"))
+    );
+    assert_eq!(
+        config
+            .agent_roles
+            .get("researcher")
+            .and_then(|role| role.model_provider.as_deref()),
+        None,
+        "provider metadata must come from the same layer as the selected config file"
     );
     assert_eq!(
         config
@@ -12144,6 +12199,10 @@ async fn multi_agent_v2_rejects_invalid_tool_namespace() -> std::io::Result<()> 
         (
             "functions",
             "features.multi_agent_v2.tool_namespace uses a reserved namespace: functions",
+        ),
+        (
+            "external_agents",
+            "features.multi_agent_v2.tool_namespace uses a reserved namespace: external_agents",
         ),
     ] {
         let codex_home = TempDir::new()?;
