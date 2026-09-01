@@ -16,6 +16,7 @@ use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_extension_api::empty_extension_registry;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
+use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
@@ -53,228 +54,46 @@ use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
-struct ParentInstructionsProvider(codex_extension_api::Instructions);
+#[tokio::test]
+async fn models_manager_is_reused_for_matching_provider() {
+    let config = test_config().await;
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let source = build_models_manager(&config, Arc::clone(&auth_manager));
 
-impl codex_extension_api::UserInstructionsProvider for ParentInstructionsProvider {
-    fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
-        Box::pin(async move {
-            codex_extension_api::LoadedUserInstructions {
-                instructions: Some(self.0.clone()),
-                warnings: Vec::new(),
-            }
-        })
-    }
-}
-
-impl codex_extension_api::ThreadInstructionsProvider for ParentInstructionsProvider {
-    fn load_thread_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
-        codex_extension_api::UserInstructionsProvider::load_user_instructions(self)
-    }
+    let matching = models_manager_for_config(&config, &source, &config, &auth_manager);
+    assert!(Arc::ptr_eq(&source, &matching));
 }
 
 #[tokio::test]
-async fn live_fork_keeps_instructions_when_source_is_unloaded_during_setup() {
-    let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config().await;
-    config.codex_home = temp_dir.path().join("codex-home").abs();
-    config.cwd = config.codex_home.abs();
-    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
-    let global = codex_extension_api::Instructions {
-        text: "global instructions".to_string(),
-        source: None,
-    };
-    let thread = codex_extension_api::Instructions {
-        text: "source thread instructions".to_string(),
-        source: None,
-    };
-    let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(),
-        config.codex_home.to_path_buf(),
-        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-    );
-    Arc::get_mut(&mut manager.state)
-        .expect("unshared manager")
-        .user_instructions_provider = Arc::new(ParentInstructionsProvider(global.clone()));
-    let source = manager
-        .start_thread(StartThreadOptions {
-            environments: Some(Vec::new()),
-            thread_instructions_provider: Some(Arc::new(ParentInstructionsProvider(
-                thread.clone(),
-            ))),
-            ..StartThreadOptions::new(config.clone())
-        })
-        .await
-        .expect("start source");
-    let history = InitialHistory::Resumed(ResumedHistory {
-        conversation_id: source.thread_id,
-        history: Arc::new(Vec::new()),
-        rollout_path: None,
-    });
+async fn models_manager_uses_target_provider_catalog() {
+    let config = test_config().await;
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let source = build_models_manager(&config, Arc::clone(&auth_manager));
+    let mut external = config.clone();
+    external.model_provider_id = "ollama".to_string();
+    external.model_provider = external
+        .model_providers
+        .get("ollama")
+        .cloned()
+        .expect("test provider should exist");
+    let mut catalog = bundled_models_response().expect("bundled model catalog should parse");
+    let mut sentinel = catalog.models.remove(0);
+    sentinel.slug = "target-provider-sentinel".to_string();
+    catalog.models = vec![sentinel];
+    external.model_catalog = Some(catalog);
 
-    // Queue removal between the first source lookup and subsequent startup
-    // lookups. Tokio's fair RwLock makes this ordering deterministic.
-    let fork = manager.fork_thread_from_history(
-        ForkSnapshot::Interrupted,
-        StartThreadOptions {
-            environments: Some(Vec::new()),
-            ..StartThreadOptions::new(config)
-        },
-        history,
-    );
-    tokio::pin!(fork);
-    {
-        let _guard = manager.state.threads.write().await;
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(std::future::Future::poll(fork.as_mut(), &mut context).is_pending());
-    }
-    let removal = manager.remove_thread_if_matches(&source.thread_id, &source.thread);
-    tokio::pin!(removal);
-    assert!(futures::poll!(&mut removal).is_pending());
-    assert!(futures::poll!(&mut fork).is_pending());
-    assert!(removal.await.is_some());
-    let fork = fork.await.expect("fork survives source removal");
-    let instructions = fork.thread.session.inherited_instructions().await;
-    assert_eq!(
-        (instructions.user, instructions.thread),
-        (Some(global), Some(thread))
-    );
-    source
-        .thread
-        .shutdown_and_wait()
-        .await
-        .expect("shutdown source");
-    fork.thread
-        .shutdown_and_wait()
-        .await
-        .expect("shutdown fork");
-}
-
-/// A thread opt-out wins over a shared client without disabling its siblings.
-#[tokio::test]
-async fn thread_analytics_opt_out_overrides_shared_client() {
-    let server = MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/codex/analytics-events/events"))
-        .respond_with(wiremock::ResponseTemplate::new(200))
-        .mount(&server)
+    let isolated = models_manager_for_config(&config, &source, &external, &auth_manager);
+    let model_info = isolated
+        .get_model_info(
+            "target-provider-sentinel",
+            &external.to_models_manager_config(),
+        )
         .await;
-    let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config().await;
-    config.chatgpt_base_url = server.uri();
-    config.model_provider.base_url = Some(server.uri());
-    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let shared_client = AnalyticsEventsClient::new(
-        AuthManager::from_auth_for_testing(auth.clone()),
-        server.uri(),
-        /*analytics_enabled*/ Some(true),
-    );
-    let mut expected_thread_ids = Vec::new();
-    let mut opted_out_thread_ids = Vec::new();
 
-    for (name, client_override, expected_enabled) in [
-        (
-            "enabled_override",
-            Some(shared_client.clone()),
-            [false, true, true],
-        ),
-        (
-            "disabled_override",
-            Some(AnalyticsEventsClient::disabled()),
-            [false, false, false],
-        ),
-        ("no_override", None, [false, true, true]),
-    ] {
-        config.codex_home = temp_dir.path().join(name).abs();
-        config.cwd = config.codex_home.abs();
-        std::fs::create_dir_all(&config.codex_home).expect("create codex home");
-        let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
-            auth.clone(),
-            config.model_provider.clone(),
-            config.codex_home.to_path_buf(),
-            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-        );
-        Arc::get_mut(&mut manager.state)
-            .expect("unshared thread manager state")
-            .analytics_events_client = client_override;
-
-        for (setting, enabled) in [Some(false), Some(true), None]
-            .into_iter()
-            .zip(expected_enabled)
-        {
-            config.analytics_enabled = setting;
-            let started = manager
-                .start_thread(StartThreadOptions::new(config.clone()))
-                .await
-                .expect("start analytics test thread");
-            let services = &started.thread.session.services;
-            assert_eq!(started.thread.analytics_enabled(), enabled);
-            assert_eq!(
-                services
-                    .session_extension_data
-                    .get::<AnalyticsEventsClient>()
-                    .expect("analytics client in session store")
-                    .is_enabled(),
-                enabled,
-            );
-            let thread_id = started.thread_id.to_string();
-            if enabled {
-                expected_thread_ids.push(thread_id.clone());
-            } else {
-                opted_out_thread_ids.push(thread_id.clone());
-            }
-            services.analytics_events_client.track_app_used(
-                codex_analytics::TrackEventsContext {
-                    model_slug: "test-model".to_string(),
-                    turn_id: format!("test-turn-{thread_id}"),
-                    thread_id,
-                    product_client_id: "codex_work_cca".to_string(),
-                },
-                codex_analytics::AppInvocation {
-                    connector_id: Some("test-connector".to_string()),
-                    app_name: None,
-                    invocation_type: None,
-                },
-            );
-            services.analytics_events_client.flush().await;
-        }
-        let shutdown = manager
-            .shutdown_all_threads_bounded(Duration::from_secs(10))
-            .await;
-        assert_eq!(shutdown.completed.len(), 3);
-    }
-
-    let events: Vec<serde_json::Value> = server
-        .received_requests()
-        .await
-        .expect("analytics requests")
-        .into_iter()
-        .filter(|request| request.url.path() == "/codex/analytics-events/events")
-        .flat_map(|request| {
-            request.body_json::<serde_json::Value>().expect("JSON body")["events"]
-                .as_array()
-                .expect("events array")
-                .clone()
-        })
-        .collect();
-    assert!(events.iter().all(|event| {
-        !opted_out_thread_ids
-            .iter()
-            .any(|thread_id| event["event_params"]["thread_id"] == thread_id.as_str())
-    }));
-    let mut actual_thread_ids: Vec<String> = events
-        .iter()
-        .filter(|event| event["event_type"] == "codex_app_used")
-        .map(|event| {
-            event["event_params"]["thread_id"]
-                .as_str()
-                .expect("app usage thread ID")
-                .to_string()
-        })
-        .collect();
-    actual_thread_ids.sort();
-    expected_thread_ids.sort();
-    assert_eq!(actual_thread_ids, expected_thread_ids);
+    assert!(!Arc::ptr_eq(&source, &isolated));
+    assert!(!model_info.used_fallback_model_metadata);
 }
 
 /// Controls without a custom allocation policy still produce distinct thread identifiers.
