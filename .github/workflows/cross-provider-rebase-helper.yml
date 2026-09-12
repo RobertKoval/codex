@@ -1,0 +1,49 @@
+name: cross-provider-rebase-helper
+
+on:
+  push:
+    branches:
+      - fix/cross-provider-subagents
+    paths:
+      - .github/workflows/cross-provider-rebase-helper.yml
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: fix/cross-provider-subagents
+
+      - name: Apply reviewed cross-provider candidate with 3-way merge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin tmp/cross-provider-candidate
+          git cherry-pick -X theirs af3072ebbcde8d47bb8592a6a3226ef1b83b560a
+
+      - name: Format Rust changes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd codex-rs
+          cargo fmt --all
+          cd ..
+          if ! git diff --quiet; then
+            git add codex-rs
+            git commit --amend --no-edit
+          fi
+
+      - name: Push integrated commit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git push origin HEAD:fix/cross-provider-subagents
