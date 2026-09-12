@@ -37,3 +37,5 @@ jobs:
       - name: Run cross-provider integration suite
         working-directory: codex-rs
         run: cargo test -p codex-core --test all cross_provider_subagents -- --nocapture
+
+# rerun after current-main API fixups
