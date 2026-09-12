@@ -9,6 +9,7 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::plaintext_agent_message_content;
+use codex_protocol::openai_models::ModelInfo;
 use codex_tools::ToolSpec;
 use futures::Stream;
 use serde_json::Value;
@@ -117,7 +118,7 @@ fn normalize_item_for_non_openai_provider(item: ResponseItem) -> Result<Option<R
     }))
 }
 
-fn strip_image_details(items: &mut [ResponseItem]) {
+fn normalize_image_details(items: &mut [ResponseItem], model_info: &ModelInfo) {
     for item in items {
         match item {
             ResponseItem::Message { content, .. } => {
