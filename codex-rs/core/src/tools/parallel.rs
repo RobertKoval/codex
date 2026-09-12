@@ -82,7 +82,9 @@ impl ToolCallRuntime {
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<ResponseItemEnvelope, CodexErr>> {
         let error_call = call.clone();
-        let future = self.handle_tool_call_with_source(call, source, cancellation_token);
+        let step_context = Arc::clone(&self.step_context);
+        let future =
+            self.handle_tool_call_with_source(step_context, call, source, cancellation_token);
         async move {
             match future.await {
                 Ok(response) => Ok(response.into_response()),

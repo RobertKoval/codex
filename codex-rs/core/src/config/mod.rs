@@ -176,6 +176,7 @@ mod resolved_permission_profile;
 #[cfg(test)]
 mod schema;
 mod subagent_model_provider;
+mod token_budget_startup;
 pub use auth_keyring::bootstrap_auth_config;
 pub use auth_keyring::resolve_bootstrap_auth_keyring_backend_kind;
 pub use codex_agent_roles::AgentRoleConfig;
@@ -205,6 +206,7 @@ pub(crate) use permissions::is_builtin_permission_profile_name;
 pub use permissions::resolve_permission_profile;
 pub(crate) use resolved_permission_profile::PermissionProfileState;
 pub(crate) use subagent_model_provider::SubagentModelProviderBaseline;
+pub use token_budget_startup::TokenBudgetStartupConfig;
 
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
