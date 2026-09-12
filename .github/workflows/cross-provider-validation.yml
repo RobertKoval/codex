@@ -1,0 +1,36 @@
+name: cross-provider-validation
+
+on:
+  push:
+    branches:
+      - fix/cross-provider-subagents
+    paths:
+      - .github/workflows/cross-provider-validation.yml
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/cross-provider-subagents
+
+      - name: Check Rust formatting
+        working-directory: codex-rs
+        run: cargo fmt --all -- --check
+
+      - name: Check affected crates
+        working-directory: codex-rs
+        run: cargo check -p codex-agent-roles -p codex-config -p codex-model-provider -p codex-core
+
+      - name: Run focused provider unit tests
+        working-directory: codex-rs
+        run: cargo test -p codex-core --lib subagent_model_provider -- --nocapture
+
+      - name: Run cross-provider integration suite
+        working-directory: codex-rs
+        run: cargo test -p codex-core --test all cross_provider_subagents -- --nocapture
