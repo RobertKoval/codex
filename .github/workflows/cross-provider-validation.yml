@@ -27,15 +27,56 @@ jobs:
         run: cargo check -p codex-agent-roles -p codex-config -p codex-model-provider -p codex-core
 
       - name: Run focused provider unit tests
+        id: provider_unit
+        continue-on-error: true
         working-directory: codex-rs
-        run: cargo test -p codex-core --lib subagent_model_provider -- --nocapture
+        shell: bash
+        run: |
+          set +e
+          cargo test -p codex-core --lib subagent_model_provider -- --nocapture > ../provider-unit.log 2>&1
+          status=$?
+          tail -n 160 ../provider-unit.log
+          exit "$status"
 
       - name: Run role provider regression test
+        id: role_regression
+        continue-on-error: true
         working-directory: codex-rs
-        run: cargo test -p codex-core --lib user_allowlisted_role_can_switch_model_provider -- --nocapture
+        shell: bash
+        run: |
+          set +e
+          cargo test -p codex-core --lib user_allowlisted_role_can_switch_model_provider -- --nocapture > ../role-regression.log 2>&1
+          status=$?
+          tail -n 160 ../role-regression.log
+          exit "$status"
 
       - name: Run cross-provider integration suite
+        id: cross_provider_e2e
+        continue-on-error: true
         working-directory: codex-rs
-        run: cargo test -p codex-core --test all cross_provider_subagents -- --nocapture
+        shell: bash
+        run: |
+          set +e
+          cargo test -p codex-core --test all cross_provider_subagents -- --nocapture > ../cross-provider-e2e.log 2>&1
+          status=$?
+          tail -n 200 ../cross-provider-e2e.log
+          exit "$status"
 
-# rerun after current-main API fixups
+      - name: Upload focused logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-provider-focused-logs
+          path: |
+            provider-unit.log
+            role-regression.log
+            cross-provider-e2e.log
+          if-no-files-found: ignore
+
+      - name: Require all focused tests
+        if: always()
+        shell: bash
+        run: |
+          test "${{ steps.provider_unit.outcome }}" = success
+          test "${{ steps.role_regression.outcome }}" = success
+          test "${{ steps.cross_provider_e2e.outcome }}" = success
