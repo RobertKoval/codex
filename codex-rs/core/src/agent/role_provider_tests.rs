@@ -46,6 +46,8 @@ async fn user_allowlisted_role_can_switch_model_provider() {
         AgentRoleConfig {
             description: Some("Custom provider child".to_string()),
             config_file: Some(role_path.to_path_buf()),
+            model_provider: Some(provider_id.to_string()),
+            model_catalog_json: None,
             nickname_candidates: None,
         },
     );
