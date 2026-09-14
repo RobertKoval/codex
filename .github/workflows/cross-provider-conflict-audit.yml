@@ -1,0 +1,38 @@
+name: cross-provider-conflict-audit
+
+on:
+  push:
+    branches:
+      - fix/cross-provider-subagents
+    paths:
+      - .github/workflows/cross-provider-conflict-audit.yml
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+      - name: Reproduce unresolved cherry-pick conflicts
+        shell: bash
+        run: |
+          set -uo pipefail
+          git fetch origin tmp/cross-provider-candidate
+          git config user.name audit
+          git config user.email audit@example.invalid
+          if git cherry-pick --no-commit af3072ebbcde8d47bb8592a6a3226ef1b83b560a; then
+            echo "NO_CONFLICTS"
+            git cherry-pick --abort 2>/dev/null || true
+            exit 0
+          fi
+          echo "CONFLICT_FILES_BEGIN"
+          git diff --name-only --diff-filter=U | sort
+          echo "CONFLICT_FILES_END"
+          git cherry-pick --abort
+          exit 0

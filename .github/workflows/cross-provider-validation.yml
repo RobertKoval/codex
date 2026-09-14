@@ -1,0 +1,82 @@
+name: cross-provider-validation
+
+on:
+  push:
+    branches:
+      - fix/cross-provider-subagents
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/cross-provider-subagents
+
+      - name: Check Rust formatting
+        working-directory: codex-rs
+        run: cargo fmt --all -- --check
+
+      - name: Check affected crates
+        working-directory: codex-rs
+        run: cargo check -p codex-agent-roles -p codex-config -p codex-model-provider -p codex-core
+
+      - name: Run focused provider unit tests
+        id: provider_unit
+        continue-on-error: true
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set +e
+          cargo test -p codex-core --lib subagent_model_provider -- --nocapture > ../provider-unit.log 2>&1
+          status=$?
+          tail -n 160 ../provider-unit.log
+          exit "$status"
+
+      - name: Run role provider regression test
+        id: role_regression
+        continue-on-error: true
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set +e
+          cargo test -p codex-core --lib user_allowlisted_role_can_switch_model_provider -- --nocapture > ../role-regression.log 2>&1
+          status=$?
+          tail -n 160 ../role-regression.log
+          exit "$status"
+
+      - name: Run cross-provider integration suite
+        id: cross_provider_e2e
+        continue-on-error: true
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set +e
+          cargo test -p codex-core --test all cross_provider_subagents -- --nocapture > ../cross-provider-e2e.log 2>&1
+          status=$?
+          tail -n 200 ../cross-provider-e2e.log
+          exit "$status"
+
+      - name: Upload focused logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-provider-focused-logs
+          path: |
+            provider-unit.log
+            role-regression.log
+            cross-provider-e2e.log
+          if-no-files-found: ignore
+
+      - name: Require all focused tests
+        if: always()
+        shell: bash
+        run: |
+          test "${{ steps.provider_unit.outcome }}" = success
+          test "${{ steps.role_regression.outcome }}" = success
+          test "${{ steps.cross_provider_e2e.outcome }}" = success

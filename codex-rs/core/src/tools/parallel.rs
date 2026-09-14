@@ -71,14 +71,17 @@ impl ToolCallRuntime {
             .create_diff_consumer(tool_name)
     }
 
-    #[instrument(level = "trace", skip_all)]
-    pub(crate) fn handle_tool_call(
+    pub(crate) fn direct_source(&self, call: &ToolCall) -> ToolCallSource {
+        self.step_context.tool_router.direct_source(call)
+    }
+
+    pub(crate) fn handle_direct_tool_call_with_source(
         self,
         call: ToolCall,
+        source: ToolCallSource,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<ResponseItemEnvelope, CodexErr>> {
         let error_call = call.clone();
-        let source = call.direct_source();
         let step_context = Arc::clone(&self.step_context);
         let future =
             self.handle_tool_call_with_source(step_context, call, source, cancellation_token);
@@ -495,8 +498,12 @@ mod tests {
             },
             encrypted_function_args: None,
         };
-        let response_task =
-            tokio::spawn(runtime.handle_tool_call(call, cancellation_token.clone()));
+        let source = runtime.direct_source(&call);
+        let response_task = tokio::spawn(runtime.handle_direct_tool_call_with_source(
+            call,
+            source,
+            cancellation_token.clone(),
+        ));
         cancellation_token.cancel();
         tokio::time::timeout(Duration::from_secs(1), response_task)
             .await
@@ -664,8 +671,12 @@ mod tests {
             encrypted_function_args: None,
         };
 
-        let response_task =
-            tokio::spawn(runtime.handle_tool_call(call, cancellation_token.clone()));
+        let source = runtime.direct_source(&call);
+        let response_task = tokio::spawn(runtime.handle_direct_tool_call_with_source(
+            call,
+            source,
+            cancellation_token.clone(),
+        ));
         tokio::time::timeout(Duration::from_secs(1), finish_started_rx)
             .await
             .expect("timed out waiting for lifecycle notification to start")
