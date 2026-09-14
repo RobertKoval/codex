@@ -1,0 +1,108 @@
+name: Enforce self-hosted runners on all branches
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Rewrite all branches and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'self-hosted-runner-migration[bot]'
+          git config user.email 'self-hosted-runner-migration@users.noreply.github.com'
+          git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
+
+          cat > "$RUNNER_TEMP/enforce_self_hosted.py" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+          root = Path(sys.argv[1])
+          workflow_dir = root / '.github' / 'workflows'
+          if not workflow_dir.is_dir(): raise SystemExit(0)
+          for path in sorted([*workflow_dir.glob('*.yml'), *workflow_dir.glob('*.yaml')]):
+              text = path.read_text(encoding='utf-8')
+              lines = text.splitlines(keepends=True)
+              out = []; i = 0; changed = False
+              while i < len(lines):
+                  line = lines[i]; raw = line.rstrip('\r\n'); nl = line[len(raw):]
+                  m = re.match(r'^(\s*)runs-on\s*:\s*(.*)$', raw)
+                  if not m:
+                      out.append(line); i += 1; continue
+                  indent, value = m.group(1), m.group(2).strip()
+                  if value:
+                      if 'self-hosted' in value: out.append(line)
+                      else: out.append(f'{indent}runs-on: self-hosted{nl}'); changed = True
+                      i += 1; continue
+                  j = i + 1; block = []
+                  while j < len(lines):
+                      candidate = lines[j]
+                      if not candidate.strip(): block.append(candidate); j += 1; continue
+                      candidate_indent = len(candidate) - len(candidate.lstrip(' '))
+                      if candidate_indent <= len(indent): break
+                      block.append(candidate); j += 1
+                  if any('self-hosted' in item for item in block): out.append(line); out.extend(block)
+                  else: out.append(f'{indent}runs-on: self-hosted{nl}'); changed = True
+                  i = j
+              new = ''.join(out)
+              if changed and new != text:
+                  path.write_text(new, encoding='utf-8')
+                  print(f'CHANGED {path.relative_to(root)}')
+          PY
+
+          cat > "$RUNNER_TEMP/verify_self_hosted.py" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+          root = Path(sys.argv[1]); d = root/'.github'/'workflows'
+          if not d.is_dir(): raise SystemExit(0)
+          bad=[]
+          for p in sorted([*d.glob('*.yml'),*d.glob('*.yaml')]):
+              ls=p.read_text(encoding='utf-8').splitlines(); i=0
+              while i<len(ls):
+                  m=re.match(r'^(\s*)runs-on\s*:\s*(.*)$',ls[i])
+                  if not m: i+=1; continue
+                  indent,val=m.group(1),m.group(2).strip()
+                  if val:
+                      if 'self-hosted' not in val: bad.append(f'{p}:{i+1}:{val}')
+                      i+=1; continue
+                  j=i+1; block=[]
+                  while j<len(ls):
+                      c=ls[j]
+                      if not c.strip(): block.append(c); j+=1; continue
+                      if len(c)-len(c.lstrip(' '))<=len(indent): break
+                      block.append(c); j+=1
+                  if not any('self-hosted' in x for x in block): bad.append(f'{p}:{i+1}:multiline-without-self-hosted')
+                  i=j
+          if bad: print('\n'.join(bad),file=sys.stderr); raise SystemExit(2)
+          PY
+
+          mapfile -t branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin | grep -v '^HEAD$' | sort)
+          echo "BRANCH_COUNT=${#branches[@]}"
+          for branch in "${branches[@]}"; do
+            echo "=== $branch ==="
+            git checkout --force -B __self_hosted_migration "refs/remotes/origin/$branch"
+            git clean -fdx
+            python3 "$RUNNER_TEMP/enforce_self_hosted.py" "$GITHUB_WORKSPACE"
+            python3 "$RUNNER_TEMP/verify_self_hosted.py" "$GITHUB_WORKSPACE"
+            if ! git diff --quiet -- .github/workflows 2>/dev/null; then
+              git add .github/workflows
+              git commit -m 'ci: use self-hosted runners only [skip ci]'
+              git push origin HEAD:"refs/heads/$branch"
+            fi
+          done
+          echo 'ALL_BRANCHES_SELF_HOSTED=1'
